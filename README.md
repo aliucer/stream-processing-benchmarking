@@ -26,10 +26,15 @@ Include a comparison table in the summary, and use ratings (binary, or 3/5 point
 ## Test Flow
 
 A: Kotlin -> NATS -> Kotlin
+
 B: Kotlin -> NATS -> Kotlin -> TiDB
+
 C: Kotlin -> NATS -> Arroyo/RisingWave -> NATS -> Kotlin (1 subject and partitioned)
+
 D: Kotlin -> NATS -> Arroyo/RisingWave -> NATS -> Kotlin Writer -> TiDB
+
 E: Kotlin -> NATS -> Arroyo -> NATS -> Benthos -> TiDB
+
 F: Kotlin -> NATS -> RisingWave -> TiDB
 
 ---
