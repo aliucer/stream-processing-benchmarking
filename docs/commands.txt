@@ -1,0 +1,18 @@
+Keep it minimal: single Gradle project, no Spring, no DI, no multi-module, no fancy CLI framework.
+
+One file per runnable: ProducerMain, ConsumerMain, MockResultsProducerMain, WriterMain, (optional DbValidatorMain).
+
+Config via env vars only (NATS URL, TiDB DSN/user/pass, rate, run_id). No config libraries.
+
+No premature optimization: single thread per component at first; batching only in DB writer as specified.
+No extra features: no dashboards, no Prometheus, no Helm/K8s, no metrics stacks.
+
+Deterministic + debuggable logs: print exactly the metrics lines we defined once per second.
+Fail fast: if streams/consumers/tables don’t exist, print a clear error and exit.
+Deliver in working order: docker compose up + ./gradlew run ... instructions that I can follow.
+
+keep code tiny.
+No “enterprise” scaffolding, no extra abstractions, no big helpers.
+No verbose logging, no huge comments, no defensive/security boilerplate beyond basics.
+Prefer straightforward code.
+Only print the 1-line-per-second metrics we defined (+ one startup line).

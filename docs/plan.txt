@@ -1,0 +1,142 @@
+<variant> ∈ {mock, arroyo, rw}
+<engine> ∈ {arroyo, rw}
+<p> ∈ {0..15}
+seq is monotonically increasing integer
+
+A: Kotlin -> NATS -> Kotlin
+B: Kotlin Mock Result producer -> NATS -> Kotlin -> TiDB 
+B publishes engine output schema directly to results.mock.<p> (with same fields as results.{arroyo|rw}.<p>)
+producer_ts_ms = window_end_ms
+C: Kotlin -> NATS -> Arroyo/RisingWave -> NATS -> Kotlin
+In C, obs_max_seq uses the result field seq (max input seq), so lag is interpreted as processing progress, not result count.
+D: Kotlin -> NATS -> Arroyo/RisingWave -> NATS -> Kotlin Writer -> TiDB
+E: Kotlin -> NATS -> Arroyo -> NATS -> Benthos -> TiDB
+F: Kotlin -> NATS -> RisingWave -> TiDB
+
+C and D will be run twice, once for arroyo and once for rw.
+
+Warmup 20s, Measure 120s
+
+What each case is for:
+A = transport sanity baseline (events.*)
+B = sink baseline (results.mock.* → TiDB)
+C = engine benchmark (events.* → results.<variant>.<p> observed at NATS)
+D/E/F = sink path benchmark (end-to-end persisted results)
+
+Streams
+EVENTS: events.*
+RESULTS: results.*
+CTRL: bench.*
+
+Producer (A/C/D/E/F)
+Publishes: events.<p>
+Publishes stats: bench.prod (in CTRL)
+
+Mock Result Producer (B)
+Publishes: results.mock.<p>
+Publishes stats: bench.prod (in CTRL)
+
+Case A
+Consumer subscribes: events.* (durable dur.A.events)
+Case B
+Kotlin writer subscribes: results.mock.* (durable dur.B.results_mock) → TiDB with variant='mock'
+Case C
+Arroyo subscribes: events.* (durable dur.C.events.arroyo) → publishes results.arroyo.<p>
+RisingWave subscribes: events.* (durable dur.C.events.rw) → publishes results.rw.<p> (only for case C)
+Kotlin observer subscribes: results.{engine}.* (durable dur.C.results.<engine>)
+Case D
+Engine publishes results.{engine}.<p>
+Kotlin writer subscribes results.{engine}.* (durable dur.D.results.<engine>) → TiDB with variant='{arroyo|rw}'
+Case E
+Arroyo publishes results.arroyo.<p>
+Benthos subscribes results.arroyo.* (durable dur.E.results.arroyo) → TiDB with variant='arroyo'
+Case F
+RisingWave subscribes events.* → writes TiDB with variant='rw'
+(No NATS results subject needed for F)
+
+
+NATS is JetStream enabled, memory storage
+Stream EVENTS: subjects events.* (16 partitions)
+Stream RESULTS: subjects results.* (16 partitions)
+
+batch_size_rows = 500, flush_interval_ms = 50, autocommit=false, payload_bytes = 512
+num_keys = 20,000
+
+bench.prod message fields:
+run_id
+prod_max_seq
+prod_rate
+producer_ts_ms_now
+
+observers keep the latest per run_id.
+
+event schema published to events.<p>:
+run_id
+event_id = run_id + "-" + seq
+seq (monotonic)
+producer_ts_ms
+key (string) = "k" + (seq % num_keys)
+value (long)
+payload_bytes (512B fixed)
+
+Output seq is a progress marker (max input seq per key/window); it is not contiguous.
+
+when publishing to partitions:
+p = hash(key) % 16
+publish to events.<p>
+
+variant output schema, per key, 10s window:
+run_id
+key
+window_end_ms
+count
+sum_value
+seq = max(input seq in that window)
+producer_ts_ms = max(input producer_ts_ms in that window)
+
+p = hash(key) % 16
+publish to results.<variant>.<p>
+
+Workload = processing-time 10s tumbling window GROUP BY key, aggregates: count, sum(value)
+
+Table: bench.window_results
+Required columns:
+variant (mock / arroyo / rw)
+run_id
+key
+window_end_ms
+count
+sum_value
+seq
+producer_ts_ms
+db_insert_ts (DB commit timestamp, default now)
+
+Primary key (idempotent):
+(variant, run_id, key, window_end_ms)
+
+Latency definition
+Secondary: db_insert_ts - producer_ts_ms
+Primary: db_insert_ts - window_end_ms
+
+lag = prod_max_seq - obs_max_seq
+For A/C: obs_max_seq = max seq seen by Kotlin consumer on the subject.
+For B/D/E/F: obs_max_seq = MAX(seq) in bench.window_results WHERE run_id=? AND variant=?
+window_end_ms = end boundary of the 10s tumbling window, aligned to epoch
+
+every one second calculate rows/s
+(cnow - cprev) / (tnow - tprev)
+WHERE run_id = ? AND variant = ?
+
+Producer prints every 1s
+PROD rate=…/s max_seq=…
+
+Observer (A/C consumer) prints every 1s
+OBS rate=…/s max_seq=… lag=… p95=…ms p99=…ms
+
+DB validator (B/D/E/F) prints every 1s
+DB rows=…/s max_seq=… lag=… p95=…ms p99=…ms
+
+In A, obs_rate = events/sec (raw inputs)
+In C, obs_rate = result rows/sec
+
+In B/D/E/F, rows/s is committed DB rows/sec.

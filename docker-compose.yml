@@ -1,0 +1,23 @@
+services:
+  nats:
+    image: nats:latest
+    command: [ "-js", "-m", "8222", "-sd", "/data" ]
+    ports:
+      - "4222:4222" # NATS client
+      - "8222:8222" # monitoring
+    volumes:
+      - nats_data:/data
+
+  tidb:
+    image: pingcap/tidb:latest
+    # TiDB defaults: SQL on 4000, status on 10080 :contentReference[oaicite:0]{index=0}
+    command: [ "--store=unistore", "--path=/data/tidb" ]
+    ports:
+      - "4000:4000" # MySQL protocol
+      - "10080:10080" # status
+    volumes:
+      - tidb_data:/data
+
+volumes:
+  nats_data:
+  tidb_data:
