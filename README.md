@@ -68,7 +68,10 @@ Complex Event Processing (CEP) & Analytics RisingWave handles complex analytics 
 RisingWave implements the PostgreSQL wire protocol, and it enables any PostgreSQL driver to be used. So, for Kotlin, standard JDBC drivers can be used to query RisingWave or insert data. It also serves materialized view results directly for real-time querying without sinking everything to TiDB, and in case processing must go beyond SQL, it provides JVM-based User Defined Functions, allowing complex processing logic to be implemented directly in Kotlin.
 
 ```kotlin
-val url = "jdbc:postgresql://risingwave-host:4566/dev" val conn = DriverManager.getConnection(url, props) val stmt = conn.createStatement() stmt.execute("CREATE MATERIALIZED VIEW user_stats AS...")
+val url = "jdbc:postgresql://risingwave-host:4566/dev"
+val conn = DriverManager.getConnection(url, props)
+val stmt = conn.createStatement()
+stmt.execute("CREATE MATERIALIZED VIEW user_stats AS...")
 ```
 
 * Scalability and Performance
