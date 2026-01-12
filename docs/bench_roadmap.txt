@@ -220,3 +220,296 @@ Notes
 • Lag in C uses output seq (max input seq per key/window), so it is a progress signal, not a
 result-count signal.
 • If lag grows across multiple windows without dropping, the pipeline is falling behind.
+
+## Configuration
+
+- Partitions: `p ∈ {0..15}` (16 subjects)
+- Workload: processing-time **10s tumbling window** `GROUP BY key`, aggregates: `count`, `sum(value)`
+- Payload: **512 bytes** fixed
+- Keys:
+  - `num_keys = 20_000`
+  - `key = "k" + (seq % num_keys)`
+- DB writer:
+  - `batch_size_rows=500`
+  - `flush_interval_ms=50`
+  - `autocommit=false`
+- Run timing:
+  - warmup **20s**
+  - measure **120s**
+
+## Cases (A–F)
+
+| Case | Flow | Purpose |
+|---|---|---|
+| A | `K -> events.<p> -> K` | Transport sanity (JetStream + client) |
+| B | `Mock -> results.mock.<p> -> K writer -> TiDB` | Sink baseline (JetStream + writer + TiDB) |
+| C | `K -> events.<p> -> Engine -> results.<engine>.<p> -> K` | Engine benchmark without DB (observe at NATS) |
+| D | `K -> events.<p> -> Engine -> results.<engine>.<p> -> K writer -> TiDB` | End-to-end with Kotlin sink path |
+| E | `K -> events.<p> -> Arroyo -> results.arroyo.<p> -> Benthos -> TiDB` | End-to-end with Benthos sink (Arroyo only) |
+| F | `K -> events.<p> -> RisingWave -> TiDB` | End-to-end with RisingWave direct sink (no results subject) |
+
+## Streams, subjects, durables
+
+### Streams
+
+| Stream | Subjects | Notes |
+|---|---|---|
+| EVENTS | `events.*` | 16 partitions: `events.0 ... events.15` |
+| RESULTS | `results.*` | `results.<variant>.<p>`, `variant ∈ {mock, arroyo, rw}` |
+| CTRL | `bench.*` | `bench.prod` heartbeat |
+
+### Durable consumer names (must match)
+
+| Case | Durable | Subscribes to |
+|---|---|---|
+| A | `dur.A.events` | `events.*` |
+| B | `dur.B.results_mock` | `results.mock.*` |
+| C | `dur.C.events.<engine>` | `events.*` (engine input) |
+| C | `dur.C.results.<engine>` | `results.<engine>.*` (Kotlin observer) |
+| D | `dur.D.events.<engine>` | `events.*` (engine input) |
+| D | `dur.D.results.<engine>` | `results.<engine>.*` (Kotlin writer) |
+| E | `dur.E.events.arroyo` | `events.*` (engine input) |
+| E | `dur.E.results.arroyo` | `results.arroyo.*` (Benthos input) |
+| F | `dur.F.events.rw` | `events.*` (engine input) |
+
+## Schemas and metrics contracts
+
+### Event schema (`events.<p>`)
+
+- `run_id`
+- `event_id = run_id + "-" + seq`
+- `seq` (monotonic, producer-side)
+- `producer_ts_ms`
+- `key = "k" + (seq % num_keys)`
+- `value` (long)
+- `payload_bytes` (512B fixed)
+
+### Partitioning
+
+- `p = hash(key) % 16`
+- Publish to `events.<p>`
+
+### Result schema (`results.<variant>.<p>`)
+
+- `run_id`
+- `key`
+- `window_end_ms` (end boundary of 10s tumbling window, epoch-aligned)
+- `count`
+- `sum_value`
+- `seq = max(input seq in that key/window)` (progress marker; not contiguous)
+- `producer_ts_ms = max(input producer_ts_ms in that key/window)`
+
+### Mock results (Case B)
+
+- Publish result schema to `results.mock.<p>`
+- `producer_ts_ms = window_end_ms`
+- `seq`: global monotonic counter (start at 1; increment by 1 per published result row)
+
+### `bench.prod` heartbeat (CTRL)
+
+- Publish every 1s by active producer
+  - Events producer: A/C/D/E/F
+  - Mock producer: B
+- Fields:
+  - `run_id`
+  - `prod_max_seq`
+  - `prod_rate` (msgs/s)
+  - `producer_ts_ms_now`
+- Observers: keep latest `bench.prod` per `run_id`
+
+## TiDB table
+
+### `bench.window_results`
+
+Columns:
+
+- `variant` (`mock` / `arroyo` / `rw`)
+- `run_id`, `key`, `window_end_ms`
+- `count`, `sum_value`, `seq`, `producer_ts_ms`
+- `db_insert_ts` (default now on insert/commit)
+
+Primary key:
+
+- `(variant, run_id, key, window_end_ms)` (idempotent inserts)
+
+## Metrics definitions
+
+- Primary latency: `db_insert_ts - window_end_ms`
+- Secondary latency: `db_insert_ts - producer_ts_ms`
+- Lag: `prod_max_seq - obs_max_seq`
+- `obs_max_seq` sources:
+  - A: max `events.seq` seen by Kotlin consumer
+  - C: max `results.seq` seen by Kotlin consumer
+  - B/D/E/F: `MAX(seq)` in TiDB filtered by `run_id` + `variant`
+- Rates:
+  - Producer rate: events msgs/s
+  - Case C observer rate: result rows/s
+  - DB rate: committed rows/s
+
+---
+
+## Build roadmap (stop at each gate)
+
+### Step 1 — Bring up infrastructure
+
+Do
+- Start docker compose: NATS (JetStream enabled, memory storage) + TiDB
+- Host reachability to NATS + TiDB
+
+Verify
+```bash
+docker compose up -d
+docker compose logs -n 50 nats
+docker compose logs -n 50 tidb
+```
+
+### Step 2 — Create JetStream streams
+
+Do
+- Create: EVENTS (`events.*`), RESULTS (`results.*`), CTRL (`bench.*`)
+- `storage=memory` for all streams
+
+Verify
+```bash
+nats stream add EVENTS --subjects "events.*" --storage memory   --retention limits --discard old --max-age -1 --no-confirm
+nats stream add RESULTS --subjects "results.*" --storage memory   --retention limits --discard old --max-age -1 --no-confirm
+nats stream add CTRL --subjects "bench.*" --storage memory   --retention limits --discard old --max-age -1 --no-confirm
+nats stream ls
+```
+
+### Step 3 — Kotlin connectivity smoke test
+
+Do
+- Publish 1 JetStream message to `bench.prod`
+- Subscribe 1 message from `bench.prod`
+- Durable consumer creation
+
+Verify
+- Publisher once
+- Subscriber once
+- Message received
+
+### Step 4 — Case A (events transport baseline)
+
+Do
+- Run `ProducerMain` (`events.*` + `bench.prod`)
+- Run `ConsumerMain` (`dur.A.events` on `events.*`)
+- Metrics line per second
+
+Verify
+- `obs_rate` ~ `prod_rate`
+- lag bounded
+- p95/p99 stable
+
+### Step 5 — TiDB schema
+
+Do
+- Create database/schema
+- Create `bench.window_results` with PK `(variant, run_id, key, window_end_ms)`
+
+Verify
+- Manual `INSERT`
+- `SELECT COUNT(*)`
+
+### Step 6 — Case B (sink baseline)
+
+Do
+- Run `MockResultsProducerMain` (`results.mock.*` + `bench.prod`)
+- Run `WriterMain` (`dur.B.results_mock`) → TiDB (batching)
+- DB validator loop (can be inside `WriterMain`): rows/s, lag, p95/p99
+
+Verify
+- rows/s stable
+- lag bounded
+- TiDB rows with `variant=mock`
+
+### Step 7 — Engine bring-up (one at a time)
+
+Do
+- Deploy Arroyo **or** RisingWave (local; docker ok)
+- Configure:
+  - input: `events.*` via `dur.C.events.<engine>`
+  - output (Case C): `results.<engine>.<p>`
+
+Verify
+- Engine consumes events
+- Engine produces results
+
+### Step 8 — Case C (engine benchmark, no DB)
+
+Do
+- Run `ProducerMain`
+- Run engine → `results.<engine>.<p>`
+- Run `ObserverMain` consuming `results.<engine>.*` (`dur.C.results.<engine>`)
+
+Verify
+- observer sees result rows
+- lag sawtooth around 10s windows
+- no unbounded growth
+
+### Step 9 — Case D (engine + Kotlin writer + TiDB)
+
+Do
+- Reuse engine from Step 8
+- Run `WriterMain` consuming `results.<engine>.*` (`dur.D.results.<engine>`)
+- Write with `variant=<engine>`
+
+Verify
+- DB rows/s stable
+- lag bounded
+
+### Step 10 — Case E (Arroyo + Benthos + TiDB)
+
+Do
+- Run Arroyo → `results.arroyo.<p>`
+- Run Benthos consuming `results.arroyo.*` (`dur.E.results.arroyo`)
+- Write to TiDB with `variant=arroyo`
+
+Verify
+- DB rows/s stable
+- lag bounded
+
+### Step 11 — Case F (RisingWave direct sink)
+
+Do
+- Configure RisingWave sink → TiDB with `variant=rw`
+- No `results.rw.*` subject
+
+Verify
+- TiDB rows with `variant=rw`
+
+### Step 12 — Benchmark run matrix
+
+Do
+- Runs: A, B, C-arroyo, C-rw, D-arroyo, D-rw, E, F
+- Per run:
+  - warmup 20s
+  - measure 120s
+  - save logs to file
+  - capture `docker stats` during measure window
+
+Verify
+- 1 log file per run
+- Summary table: peak rate, p95, p99, lag trend
+
+---
+
+## Metrics log line contract
+
+```text
+Producer
+PROD rate=50000/s max_seq=1200000 run_id=...
+
+Observer (Case A and Case C)
+OBS rate=2000/s max_seq=1189000 lag=11000 p95=35ms p99=80ms run_id=...
+
+DB validator (Case B/D/E/F)
+DB rows=2000/s max_seq=1189000 lag=11000 p95=120ms p99=250ms run_id=...
+```
+
+## Notes
+
+- Case A: rate = events/sec
+- Case C: rate = result rows/sec
+- Case C lag uses output `seq` (max input seq per key/window)
+- Lag grows across multiple windows without dropping → falling behind
