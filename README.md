@@ -19,8 +19,6 @@ We are interested in selecting a stream processing solution for our backend, wit
 * Ease of administration (unlike Kafka or Flink)
 * Ability to scale horizontally (distributed)
 
-Include a comparison table in the summary, and use ratings (binary, or 3/5 points) for factors where it makes sense.
-
 ---
 
 ## Test Flow
